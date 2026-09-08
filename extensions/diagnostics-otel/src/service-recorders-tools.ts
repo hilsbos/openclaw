@@ -23,6 +23,8 @@ export function createToolAndSystemRecorders(runtime: DiagnosticsRecorderRuntime
     skillUsedCounter,
     toolExecutionDurationHistogram,
     toolExecutionBlockedCounter,
+    toolCallCounter,
+    toolCallDurationHistogram,
     execProcessDurationHistogram,
     payloadLargeCounter,
     payloadLargeBytesHistogram,
@@ -188,6 +190,30 @@ export function createToolAndSystemRecorders(runtime: DiagnosticsRecorderRuntime
       });
     setSpanAttrs(span, spanAttrs);
     span.end(toolTimestampMs(evt));
+  };
+
+  const recordToolCall = (evt: Extract<DiagnosticEventPayload, { type: "tool.call" }>) => {
+    const attrs = {
+      "openclaw.tool": evt.toolName,
+      "openclaw.outcome": evt.isError ? "error" : "success",
+      ...(evt.channel ? { "openclaw.channel": evt.channel } : {}),
+    };
+    toolCallCounter.add(1, attrs);
+    if (typeof evt.durationMs === "number") {
+      toolCallDurationHistogram.record(evt.durationMs, attrs);
+    }
+    if (!tracesEnabled) {
+      return;
+    }
+    const spanAttrs: Record<string, string | number> = { ...attrs };
+    if (evt.toolCallId) {
+      spanAttrs["openclaw.toolCallId"] = evt.toolCallId;
+    }
+    const span = spanWithDuration("openclaw.tool.call", spanAttrs, evt.durationMs);
+    if (evt.isError) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: "tool call error" });
+    }
+    span.end();
   };
 
   const recordPayloadLarge = (evt: Extract<DiagnosticEventPayload, { type: "payload.large" }>) => {
@@ -390,6 +416,7 @@ export function createToolAndSystemRecorders(runtime: DiagnosticsRecorderRuntime
     recordToolExecutionStarted,
     recordToolExecutionFinished,
     recordToolExecutionBlocked,
+    recordToolCall,
     recordPayloadLarge,
     recordExecProcessCompleted,
     recordHeartbeat,

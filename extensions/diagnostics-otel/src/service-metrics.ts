@@ -203,6 +203,14 @@ export function createDiagnosticsMetrics(
       unit: "By",
       description: "Talk audio frame byte lengths",
     }),
+    toolCallCounter: createCounter("openclaw.tool.calls", {
+      unit: "1",
+      description: "Tool calls by tool name and outcome",
+    }),
+    toolCallDurationHistogram: createHistogram("openclaw.tool.duration_ms", {
+      unit: "ms",
+      description: "Tool execution duration",
+    }),
     runAttemptCounter: createCounter("openclaw.run.attempt", {
       unit: "1",
       description: "Run attempts",

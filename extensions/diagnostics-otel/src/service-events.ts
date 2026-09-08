@@ -69,6 +69,7 @@ export function createDiagnosticsEventHandler(params: {
     recordToolExecutionFinished,
     recordToolExecutionBlocked,
     recordSkillUsed,
+    recordToolCall,
     recordExecProcessCompleted,
     recordToolLoop,
     recordMemorySample,
@@ -162,6 +163,9 @@ export function createDiagnosticsEventHandler(params: {
           break;
         case "run.progress":
           break;
+        case "tool.call":
+          recordToolCall(evt);
+          return;
         case "run.execution_phase":
           break;
         case "diagnostic.heartbeat":

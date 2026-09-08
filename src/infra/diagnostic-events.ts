@@ -836,6 +836,17 @@ export type DiagnosticAsyncQueueDroppedEvent = DiagnosticBaseEvent & {
   drainBatchSize: number;
 };
 
+export type DiagnosticToolCallEvent = DiagnosticBaseEvent & {
+  type: "tool.call";
+  sessionKey?: string;
+  sessionId?: string;
+  channel?: string;
+  toolName: string;
+  toolCallId?: string;
+  durationMs?: number;
+  isError: boolean;
+};
+
 export type DiagnosticEventPayload =
   | DiagnosticGatewayRpcEvent
   | DiagnosticUsageEvent
@@ -892,7 +903,8 @@ export type DiagnosticEventPayload =
   | DiagnosticSecurityEvent
   | DiagnosticTelemetryExporterEvent
   | DiagnosticAsyncQueueDroppedEvent
-  | DiagnosticFailoverEvent;
+  | DiagnosticFailoverEvent
+  | DiagnosticToolCallEvent;
 
 type DiagnosticNonSecurityEventPayload = Exclude<DiagnosticEventPayload, DiagnosticSecurityEvent>;
 

@@ -11,6 +11,7 @@ import {
   type AgentPatchSummaryEventData,
 } from "../infra/agent-activity-events.js";
 import { emitAgentEvent, type AgentApprovalEventData } from "../infra/agent-events.js";
+import { emitDiagnosticEvent } from "../infra/diagnostic-events.js";
 import type { PluginHookAfterToolCallEvent } from "../plugins/types.js";
 import { projectProgressCardChannelUpdate } from "../session-cards/progress-card-channel-summary.js";
 import { normalizeAcceptedSessionSpawnResult } from "./accepted-session-spawn.js";
@@ -687,6 +688,19 @@ export async function handleToolExecutionEnd(
   }
   await Promise.resolve(ctx.params.onToolStreamBoundary?.()).catch((error: unknown) => {
     ctx.log.debug(`embedded run tool stream boundary callback failed: ${String(error)}`);
+  });
+
+  // Emit tool.call diagnostic event for OTel metrics
+  const toolDurationMs = startData?.startTime != null ? Date.now() - startData.startTime : undefined;
+  emitDiagnosticEvent({
+    type: "tool.call",
+    sessionKey: ctx.params.sessionKey,
+    sessionId: ctx.params.sessionId,
+    channel: ctx.params.agentId,
+    toolName,
+    toolCallId,
+    durationMs: toolDurationMs,
+    isError: isToolError,
   });
 
   // Run after_tool_call plugin hook (fire-and-forget)
