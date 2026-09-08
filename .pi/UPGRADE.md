@@ -804,3 +804,237 @@ short of 7.5.21) and `/app/node_modules/undici` (8.5.0, one HIGH short of
 9-commit delta. `@vitest/browser` CRITICAL is the same transitive
 dev/test-only dependency noted last cycle (not part of the live attack
 surface).
+## v2026.9.3 upgrade notes (2026-09-08)
+
+### STOP: matrix channels broken post-deploy — new failure mode, needs follow-up
+
+All four matrix accounts (default, jarvis, nemo, sensei) crash-loop after
+this deploy:
+
+```
+[matrix] [default] channel exited: Cannot find package 'matrix-js-sdk' imported from /app/dist/send-o15o3BF4.mjs
+```
+
+Root cause: upstream's build now code-splits some matrix-adjacent logic into
+a shared bundle chunk at `/app/dist/send-*.mjs` (top-level `dist/`, not under
+`dist/extensions/matrix/`). Node's module resolution from that file walks up
+to `/app/node_modules/`, but `matrix-js-sdk` is only linked into the
+*plugin-local* `dist/extensions/matrix/node_modules/matrix-js-sdk` symlink
+(confirmed present and correctly resolving to
+`node_modules/.pnpm/matrix-js-sdk@42.2.0_.../`) by the new
+`runtime-assets`-stage plugin-dependency-linking step in `Dockerfile`
+("link the selected plugins' plugin-local dependencies under
+`dist/extensions/<id>`"). That linking scope doesn't cover a shared chunk
+that lives outside the plugin's own directory tree, so `matrix-js-sdk` is
+unresolvable from there. `matrix-js-sdk` is NOT hoisted to top-level
+`/app/node_modules/matrix-js-sdk` (confirmed absent) because it's an
+optional/plugin-scoped dependency, unlike the `openclaw` self-reference case
+below which this is NOT the same as.
+
+This is **not** the documented "v2026.4.15+ matrix self-reference gotcha"
+(that one is about the package literally named `openclaw`, fixed via the
+`ln -sf /app /app/node_modules/openclaw` symlink already in
+`Dockerfile.local` — still present and doing its job; no "Cannot find
+package 'openclaw'" errors this cycle). This is a new gap: upstream's
+prod-dependency-pruning restructuring (the `production-deps` /
+`runtime-build-output` / `runtime-assets` stage split, see the Dockerfile
+diff summary below) doesn't yet handle a plugin dependency needed by code
+that upstream itself split out of the plugin's own directory.
+
+**Left unresolved deliberately** — this needs either an upstream fix or a
+`Dockerfile.local` patch that also hoists (or symlinks) `matrix-js-sdk` (and
+possibly other plugin deps referenced from shared chunks) to top-level
+`/app/node_modules/`, and that's a build-pipeline change beyond "replay our
+15-file delta," so it needs review rather than a same-session guess.
+Gateway itself is healthy and Telegram works for all 4 agents; only Matrix
+is down. `docker exec openclaw-openclaw-cli-1 bash -c "ls /app/dist/extensions/matrix/node_modules"`
+and `grep -o matrix-js-sdk /app/dist/send-o15o3BF4.mjs` reproduce the
+diagnosis (the exact chunk filename is a content hash and will change on
+the next build).
+
+### Config schema drift required `openclaw doctor --fix` mid-upgrade
+
+This cycle's ~2-month/24,853-commit delta (far bigger than prior weekly-ish
+cycles) meant `openclaw.json` had accumulated enough deprecated/renamed keys
+that the gateway refused to start at all (`Invalid config`: ~15 unrecognized
+keys spanning `meta.lastTouchedAt`, `env.*` flattened keys, compaction
+settings, `tools.media.audio.models`, `messages.tts`, `commands.ownerDisplay`,
+several `gateway.*` keys, `plugins.bundledDiscovery`) plus a required state
+DB schema migration (`audit-events-v2`). Both are explicitly what
+`openclaw doctor --fix` is for (the gateway's own crash message names it).
+Ran it via `docker exec openclaw-openclaw-cli-1 openclaw doctor --fix` —
+first attempt raced the still-restarting gateway container for the state
+lock and bailed early; stopped the gateway container first, reran cleanly,
+then restarted the gateway. Confirmed the fix by checking `openclaw.json`
+directly (`meta.lastTouchedAt` gone, `env` keys now under `env.vars`) rather
+than trusting doctor's own "complete" banner alone.
+
+**Pre-flight tip for next cycle:** if the incoming delta is on the order of
+months/tens-of-thousands of commits rather than days/hundreds, expect
+`openclaw doctor --fix` to be a required step, not just a fallback for the
+already-documented gotchas below — factor it into the runbook up front
+rather than discovering it at deploy time.
+
+### Strategy B stats
+
+- Incoming commits: 24,853 (v2026.7.1-2 → v2026.9.3, per `git rev-list --count`)
+- `git merge-base custom v2026.9.3` again fell back to an ancient ancestor
+  (upstream rewrote its own main history again between these releases,
+  same phenomenon as v2026.6.11→v2026.7.1 and v2026.6.10→v2026.6.11) — used
+  the known prior release tag `v2026.7.1-2` as `BASE` directly, per the
+  existing caveat above.
+- Confirmed `v2026.9.3` is on the feature mainline we track (not the
+  "extended-stable" maintenance branch) by reading `CHANGELOG.md` content at
+  v2026.8.1/8.2/9.1/9.2/9.3: each references the prior release's features
+  and none says "maintenance release... without new release-line features."
+- Our custom delta: 15 files (3 truly additive, 0 zero-upstream-churn,
+  10 upstream-churned + 2 files whose sole customization is now obsolete —
+  see below). Every touched file had upstream churn this cycle (no
+  zero-churn files, unlike prior smaller-delta cycles).
+- Conflicts and resolutions:
+  - `GatewayConnectionController.swift`: upstream's TLS-fingerprint-probe
+    refactor (enum-based `finish()`, new delegate method) already contains
+    our exact fix (`completionHandler(.useCredential, credential)` instead
+    of `.cancelAuthenticationChallenge`) natively — no port needed, just
+    took upstream's version as-is.
+  - `extensions/diagnostics-otel/src/service.ts`: upstream split this
+    monolithic file into `service-metrics.ts`, `service-events.ts`,
+    `service-recorders-tools.ts`, etc. Ported our `toolCallCounter`/
+    `toolCallDurationHistogram` OTel instruments into `service-metrics.ts`
+    and the `recordToolCall` handler + `tool.call` switch case into
+    `service-recorders-tools.ts`/`service-events.ts` respectively, at the
+    same logical anchor points (after `talkAudioBytesHistogram`; after
+    `onToolStreamBoundary`/before `run.progress`→`diagnostic.heartbeat`).
+    Note: upstream has also built out a much richer native
+    `tool.execution.started/completed/error/blocked` instrumentation family
+    (`toolExecutionDurationHistogram`, `openclaw.tool.execution` spans,
+    etc.) that may now partially overlap with our simpler `tool.call`
+    event — kept both per established precedent (v2026.6.11 notes: "kept
+    our emitDiagnosticEvent block") rather than unilaterally judging ours
+    redundant; worth a design review outside this upgrade.
+  - `src/agents/embedded-agent-subscribe.handlers.tools.ts`: upstream moved
+    `handleToolExecutionEnd` into a new sibling
+    `embedded-agent-subscribe.handlers.tools.completion.ts` (the original
+    file is now just a re-export). Ported our `tool.call` diagnostic-event
+    emission to the new file at the identical anchor (after the
+    tool-stream-boundary callback, before the `after_tool_call` hook).
+  - `ui/src/components/app-sidebar.ts` + `ui/src/components/dashboard-header.ts`
+    + the eyebrow/title rules in `ui/src/styles/layout.css`: **intentionally
+    not ported, by design decision, not oversight.** Upstream's Control UI
+    sidebar redesign replaced the old static logo/eyebrow/title brand block
+    (`renderBrand()` in `app-sidebar.ts`) with a dynamic
+    `<openclaw-sidebar-agent-card>` (now in the new `app-sidebar-render.ts`)
+    that shows the active agent's *configured* display name/avatar — there
+    is no static logo to hide and no static title slot to override anymore;
+    the "maX" identity now surfaces automatically from agent config. Upstream
+    also removed the mobile-viewport `dashboard-header.ts` breadcrumb
+    entirely (`app-topbar.ts`'s narrow header is now a fixed OpenClaw/logo
+    brand with no per-route breadcrumb), so `dashboard-header.ts`'s sole
+    consumer is gone — deleted rather than resurrected. Verified via
+    `git grep -n "sidebar-brand__title\|sidebar-brand__eyebrow"` at
+    v2026.9.3: zero matches anywhere in `ui/src`, confirming this isn't a
+    porting gap but a genuine upstream structural removal. If a future
+    cycle wants "maX" branding restored to the sidebar, it should be done
+    by setting the agent's display name to "maX" in config (if not already)
+    rather than re-adding dead CSS/markup — check the memory/config first.
+  - `ui/src/styles/base.css`: preserved the electric-blue accent theme
+    through upstream's larger palette restructuring (new `--rail-header-*`,
+    `--lobster-icon-*`, `--link`/`--link-hover` derivation tokens, and a
+    WCAG-audit comment block describing the *red* palette's contrast
+    ratios). Kept all of upstream's new structural tokens, substituted only
+    the color values our patch always touched
+    (`--border`/`--border-strong`/`--border-hover`/`--input`/`--ring`/
+    `--accent`/`--accent-hover`/`--accent-muted`/`--accent-subtle`/
+    `--accent-glow`/`--primary`), and dropped the WCAG comment block since
+    its specific contrast numbers describe colors we no longer ship (no
+    attempt made to recompute accurate ratios for blue — flag for a real
+    audit if that matters). New: upstream introduced `--primary-hover`
+    (previously `--primary` had no separate hover token); set it to
+    `#2563eb` (a darker blue already used as this palette's light-theme
+    accent) to preserve the existing "primary tracks accent" intent now
+    that hover states are split — a judgment call, not something upstream
+    specified, worth a design look.
+- Verification loop (`git diff custom..custom-NEW`) flagged every touched
+  file as "DIFFERS" from old `custom`, as expected for a cycle where every
+  file also had upstream churn — reviewed each individually above rather
+  than treating that loop's output as pass/fail.
+
+### Dockerfile/docker-compose.yml changes (reviewed, no security concerns)
+
+Upstream restructured the multi-stage build significantly this cycle:
+plugin selection moved from inline shell/grep to a real Node script
+(`scripts/lib/docker-plugin-selection.mjs`, with input validation on
+`OPENCLAW_EXTENSIONS` ids); dependency install split into a dedicated
+`production-deps` stage inherited by both `build` and the final
+`runtime-assets` stage (avoiding a second full `pnpm prune` pass); the
+runtime image now runs `apt-get dist-upgrade` for current Debian point-release
+security fixes, adds `openssh-client` (sandbox backend spawns `ssh` directly)
+and `libgomp1` (llama-server OpenMP dependency); npm's own bundled
+dependency tree gets patched via `npm install --global npm@latest` +
+`--ignore-scripts` update; the Docker GPG-key fetch now has explicit
+`--connect-timeout`/`--max-time`; the healthcheck moved from an inline
+`node -e fetch(...)` to a checked-in `dist/docker-healthcheck.js` (reviewed:
+just probes the local gateway port via the existing lock-file/config
+resolution, nothing new). All reviewed directly, no backdoors/obfuscation/
+credential exposure/supply-chain concerns. Base image digests
+(node:24-bookworm, node:24-bookworm-slim, bun 1.3.13→1.4.0) bumped to
+current upstream digest pins.
+
+### gogcli 0.37.0 → 0.39.1, goplaces 0.4.4 → 0.4.9
+
+Release-noted as feature/reliability-only across both (Workspace feature
+additions, pagination-loop hardening, HTTP timeout/retry bounding — see
+commit for the per-release breakdown). goplaces 0.4.5–0.4.8 were confirmed
+unpublished duplicates of 0.4.9 (release-automation bring-up tags per its own
+changelog). Both extraction commands in `Dockerfile.local` already use the
+robust `find -name <bin> -exec install` pattern from the v2026.7.1-2 fix, so
+no further hardening needed for this bump.
+
+### Security review (Step 2) — clean
+
+- **gitleaks** on `custom..v2026.9.3` (24,558 commits scanned): 278,923 raw
+  hits, 51 after the documented `.i18n`/`.test.` filter. All 51 manually
+  reviewed: GitHub App OAuth **client IDs** (`Iv23li...`, meant to be
+  public, not secrets) recorded in CI workflow files, doc examples with
+  placeholder discord/API-key values, `test-support`/`test-helpers`/
+  `test-utils`/QA-scenario fixture files with explicitly-fake tokens
+  (`sk-1234567890abcdef`, `AKIAFAKE...`, `xoxb-intentionally...`), and a
+  handful of string constants misidentified as secrets by regex
+  (`notifications.web.v1`, `idempotency-1`, `ed25519PrivateKeyPemFromRaw` —
+  a function name, not a key). No real leaked credential found. The
+  false-positive surface is much wider than the doc's `.i18n`/`.test.`
+  classes for a delta this size — OAuth client IDs and QA-scenario YAML in
+  particular are worth adding to the standard filter for future cycles.
+- **semgrep** `p/security-audit` against a `v2026.9.3` worktree, filtered to
+  the 32,776 changed files matching the doc's extension list: 0 findings.
+- **Dependency diff** (root `package.json`, BASE vs TARGET): 11 new direct
+  deps (`@trycua/cua-driver`, `acorn`, `entities`, `execa`, `iconv-lite`,
+  `koffi`, `ms`, `p-limit`, `p-map`, `pretty-ms`, `semver`), 32 new
+  devDependencies (playwright, vite, postcss/stylelint tooling, `baileys`,
+  `nostr-tools`, etc.) — all well-known, non-typosquat packages appropriate
+  to features visible elsewhere in the changelog (computer-use, WhatsApp/
+  Nostr channels, UI tooling). `glob`, `proper-lockfile`, `@grammyjs/types`
+  removed.
+  - `node --input-type=module -e 'await import("grammy")'` build-time
+    sanity check confirms `grammy` (the actual runtime dep, not
+    `@grammyjs/types`) still resolves post-restructuring.
+- Commit-message security-track-record grep
+  (`security|auth|cred|secret`, case-insensitive): 1,080 matches across the
+  delta — all routine fix/refactor/hardening work (credential redaction,
+  unauthorized-scrape rejection, OAuth flow fixes), nothing resembling a
+  backdoor or an intentional auth bypass.
+
+### Trivy image scan (informational)
+
+Much lighter than prior cycles: Debian OS packages carry the usual
+`affected`/`fix_deferred`/`will_not_fix` baseline (including the
+long-standing `will_not_fix` zlib CRITICAL, unchanged from prior cycles —
+not introduced by us), reduced further this cycle by the new
+`apt-get dist-upgrade` step. `gogcli`/`goplaces` binaries: **zero**
+HIGH/CRITICAL findings (embedded Go stdlib fully clean on both, continuing
+last cycle's gogcli improvement and now goplaces catching up too). Node
+app-dependency layer: one HIGH, `adm-zip@0.5.17` (fixed in 0.6.0) — a
+transitive dependency, not declared directly in our `package.json` or any
+bundled extension's; upstream-owned, not introduced by our delta.
+`usr/bin/gh` (apt-installed): 2 HIGH, both the routine Go-stdlib-in-binary
+class seen every cycle.
