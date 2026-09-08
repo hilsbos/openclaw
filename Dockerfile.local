@@ -1,0 +1,69 @@
+# Dockerfile.local — Local customizations layered on top of the upstream build.
+#
+# Build order:
+#   1. docker build -t openclaw-base:latest \
+#        --build-arg OPENCLAW_INSTALL_BROWSER=1 \
+#        --build-arg OPENCLAW_EXTENSIONS="matrix" \
+#        -f Dockerfile .
+#   2. docker build -t openclaw:latest -f Dockerfile.local .
+#
+# Pinned binary versions — bump periodically during upgrade cycles.
+# gh stays on apt for auto security updates on every rebuild.
+
+ARG BASE_IMAGE=openclaw-base:latest
+ARG GOGCLI_VERSION=0.39.1
+ARG GOPLACES_VERSION=0.4.9
+
+FROM ${BASE_IMAGE}
+
+ARG GOGCLI_VERSION
+ARG GOPLACES_VERSION
+
+USER root
+
+# Remap node UID/GID to match host user (996/986).
+# socat: required by scripts/sandbox-browser-entrypoint.sh for CDP relay.
+RUN usermod -u 996 node && groupmod -g 986 node && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends socat && \
+    rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI — apt install auto-updates on each rebuild.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pinned binaries (Gmail/Calendar/Drive CLI + Google Places CLI).
+# Extract into a scratch dir and locate the binary by name rather than
+# assuming a flat tar layout -- release CI has changed archive structure
+# (e.g. gogcli >=0.35 wraps the binary in a "./" dir entry) without notice.
+RUN mkdir -p /tmp/gogcli-extract /tmp/goplaces-extract && \
+    curl -fL https://github.com/steipete/gogcli/releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_amd64.tar.gz \
+      | tar xz -C /tmp/gogcli-extract && \
+    find /tmp/gogcli-extract -type f -name gog -exec install -m 0755 {} /usr/local/bin/gog \; && \
+    curl -fL https://github.com/steipete/goplaces/releases/download/v${GOPLACES_VERSION}/goplaces_${GOPLACES_VERSION}_linux_amd64.tar.gz \
+      | tar xz -C /tmp/goplaces-extract && \
+    find /tmp/goplaces-extract -type f -name goplaces -exec install -m 0755 {} /usr/local/bin/goplaces \; && \
+    rm -rf /tmp/gogcli-extract /tmp/goplaces-extract && \
+    test -x /usr/local/bin/gog && test -x /usr/local/bin/goplaces
+
+# Matrix bundle in /app/dist/extensions/matrix/ self-references the parent
+# package as "openclaw/plugin-sdk/*", but that subtree's package.json is
+# @openclaw/matrix — Node's self-reference fails. Expose the root via
+# node_modules so the bare "openclaw" specifier resolves.
+RUN ln -sf /app /app/node_modules/openclaw
+
+# XDG config symlinks (exec env sanitizer strips XDG_CONFIG_HOME, so tools
+# fall back to ~/.config/<app>). Git identity for agent commits.
+RUN mkdir -p /home/node/.config && \
+    ln -sf /home/node/.openclaw/gogcli /home/node/.config/gogcli && \
+    ln -sf /home/node/.openclaw/gh     /home/node/.config/gh && \
+    git config --system user.name "maX" && \
+    git config --system user.email "max@shushu.be"
+
+USER node
