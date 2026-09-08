@@ -352,7 +352,7 @@ The `custom` branch adds ~20 files on top of upstream. These fall into three buc
 | File                          | Purpose                                                              |
 | ----------------------------- | -------------------------------------------------------------------- |
 | `.pi/UPGRADE.md`              | This document                                                        |
-| `Dockerfile.local`            | Runtime overlay: UID/GID remap, socat, gh, gogcli, goplaces, matrix openclaw symlink |
+| `Dockerfile.local`            | Runtime overlay: UID/GID remap, socat, gh, gogcli, goplaces, matrix openclaw symlink, matrix plugin-dependency hoisting |
 | `docker-compose.override.yml` | Dev overrides: 127.0.0.1 binding, env_file, ollama sidecar, extra env vars |
 
 ### Modified (our delta on upstream files)
@@ -806,51 +806,79 @@ dev/test-only dependency noted last cycle (not part of the live attack
 surface).
 ## v2026.9.3 upgrade notes (2026-09-08)
 
-### STOP: matrix channels broken post-deploy — new failure mode, needs follow-up
+### v2026.9.3 matrix plugin-dependency hoisting gotcha
 
-All four matrix accounts (default, jarvis, nemo, sensei) crash-loop after
-this deploy:
+**Symptom:** All matrix accounts crash-loop right after deploy:
 
 ```
-[matrix] [default] channel exited: Cannot find package 'matrix-js-sdk' imported from /app/dist/send-o15o3BF4.mjs
+[matrix] [default] channel exited: Cannot find package 'matrix-js-sdk' imported from /app/dist/send-<hash>.mjs
 ```
 
-Root cause: upstream's build now code-splits some matrix-adjacent logic into
-a shared bundle chunk at `/app/dist/send-*.mjs` (top-level `dist/`, not under
-`dist/extensions/matrix/`). Node's module resolution from that file walks up
-to `/app/node_modules/`, but `matrix-js-sdk` is only linked into the
-*plugin-local* `dist/extensions/matrix/node_modules/matrix-js-sdk` symlink
-(confirmed present and correctly resolving to
-`node_modules/.pnpm/matrix-js-sdk@42.2.0_.../`) by the new
-`runtime-assets`-stage plugin-dependency-linking step in `Dockerfile`
-("link the selected plugins' plugin-local dependencies under
-`dist/extensions/<id>`"). That linking scope doesn't cover a shared chunk
-that lives outside the plugin's own directory tree, so `matrix-js-sdk` is
-unresolvable from there. `matrix-js-sdk` is NOT hoisted to top-level
-`/app/node_modules/matrix-js-sdk` (confirmed absent) because it's an
-optional/plugin-scoped dependency, unlike the `openclaw` self-reference case
-below which this is NOT the same as.
+(the exact `send-<hash>.mjs` filename is a content hash and changes on every
+build; the same failure also shows up from other shared chunks —
+`sdk-<hash>.mjs`, `crypto-runtime-<hash>.mjs`, `crypto-node.runtime-<hash>.mjs`,
+`monitor-<hash>.mjs`, and the `music-metadata` format-parser chunks —
+depending on which one loads first).
 
-This is **not** the documented "v2026.4.15+ matrix self-reference gotcha"
-(that one is about the package literally named `openclaw`, fixed via the
-`ln -sf /app /app/node_modules/openclaw` symlink already in
-`Dockerfile.local` — still present and doing its job; no "Cannot find
-package 'openclaw'" errors this cycle). This is a new gap: upstream's
-prod-dependency-pruning restructuring (the `production-deps` /
-`runtime-build-output` / `runtime-assets` stage split, see the Dockerfile
-diff summary below) doesn't yet handle a plugin dependency needed by code
-that upstream itself split out of the plugin's own directory.
+**Root cause:** v2026.9.3 code-splits several matrix-adjacent (and
+music-metadata) code paths into shared bundle chunks that live directly
+under top-level `/app/dist/`, not under `/app/dist/extensions/matrix/`.
+Node's module resolution from one of those chunks walks straight to
+`/app/node_modules/`, but the new `runtime-assets`-stage
+plugin-dependency-linking step in `Dockerfile` only links a plugin's
+dependencies under that *plugin's own* `dist/extensions/<id>/node_modules/`
+— it never hoists them to top-level `/app/node_modules/`. So a package that
+used to be reachable only from inside the plugin's own directory tree is no
+longer reachable from a shared chunk that lives outside it. Confirmed via
+`docker exec <gateway> bash -c 'ls /app/node_modules/matrix-js-sdk'` (absent)
+vs. `ls /app/dist/extensions/matrix/node_modules/matrix-js-sdk` (present,
+correctly symlinked into `node_modules/.pnpm/matrix-js-sdk@42.2.0_.../`).
+Affects four packages total, all confirmed missing at top level but present
+and correctly linked under `dist/extensions/matrix/node_modules/`:
+`matrix-js-sdk`, `music-metadata`, `@matrix-org/matrix-sdk-crypto-nodejs`,
+`@matrix-org/matrix-sdk-crypto-wasm` (`fake-indexeddb` and `markdown-it` are
+also missing at top level but not referenced from any top-level chunk, so
+they don't need this fix).
 
-**Left unresolved deliberately** — this needs either an upstream fix or a
-`Dockerfile.local` patch that also hoists (or symlinks) `matrix-js-sdk` (and
-possibly other plugin deps referenced from shared chunks) to top-level
-`/app/node_modules/`, and that's a build-pipeline change beyond "replay our
-15-file delta," so it needs review rather than a same-session guess.
-Gateway itself is healthy and Telegram works for all 4 agents; only Matrix
-is down. `docker exec openclaw-openclaw-cli-1 bash -c "ls /app/dist/extensions/matrix/node_modules"`
-and `grep -o matrix-js-sdk /app/dist/send-o15o3BF4.mjs` reproduce the
-diagnosis (the exact chunk filename is a content hash and will change on
-the next build).
+This is **not** the existing "v2026.4.15+ matrix self-reference gotcha"
+above (that one is about the package literally named `openclaw`, fixed via
+`ln -sf /app /app/node_modules/openclaw`, and is unrelated/unaffected here)
+— it's a new gap in upstream's prod-dependency-pruning restructuring this
+cycle (the `production-deps`/`runtime-build-output`/`runtime-assets` stage
+split described in the Dockerfile changes section above).
+
+**Fix:** `Dockerfile.local` now symlinks the four affected packages into
+top-level `/app/node_modules/` through the already-correct plugin-local
+links (not the pnpm virtual-store path directly, so this survives a future
+rebuild even if the store's patch-hash suffix changes), right after the
+`openclaw` self-reference symlink, with a `node -e "require.resolve(...)"`
+build-time check so a future re-break fails the build instead of shipping
+silently:
+
+```dockerfile
+RUN mkdir -p /app/node_modules/@matrix-org && \
+    for pkg in matrix-js-sdk music-metadata @matrix-org/matrix-sdk-crypto-nodejs @matrix-org/matrix-sdk-crypto-wasm; do \
+      ln -sf "/app/dist/extensions/matrix/node_modules/$pkg" "/app/node_modules/$pkg"; \
+    done && \
+    node -e "require.resolve('matrix-js-sdk'); require.resolve('music-metadata'); require.resolve('@matrix-org/matrix-sdk-crypto-nodejs'); require.resolve('@matrix-org/matrix-sdk-crypto-wasm')"
+```
+
+Verified post-fix: all 4 matrix accounts reach `running, connected,
+health:healthy` (`openclaw channels status`), crypto bootstrap succeeds
+(decrypting backlog events, including "Decrypted event on retry" for
+messages that arrived before sync completed), zero `channel exited` /
+`Cannot find package` log lines, and each account's "starting provider" log
+line appears exactly once (no restart loop). The handful of
+`DecryptionError: ... key backup is not working` lines seen alongside this
+are pre-existing/expected (messages sent before a given device logged in,
+unrelated to this fix — normal Matrix E2EE behavior, not a regression).
+
+If a future cycle adds a new bundled extension with plugin-scoped
+dependencies, check whether upstream's `dist/` code-splitting references
+that extension's deps from a top-level chunk the same way
+(`grep -rl "<package-name>" /app/dist/*.mjs`, excluding
+`dist/extensions/<id>/`) before assuming the plugin-local link alone is
+sufficient.
 
 ### Config schema drift required `openclaw doctor --fix` mid-upgrade
 
