@@ -58,6 +58,25 @@ RUN mkdir -p /tmp/gogcli-extract /tmp/goplaces-extract && \
 # node_modules so the bare "openclaw" specifier resolves.
 RUN ln -sf /app /app/node_modules/openclaw
 
+# v2026.9.3 split several matrix code paths into shared top-level dist/*.mjs
+# chunks (dist/send-*.mjs, dist/sdk-*.mjs, dist/crypto-runtime-*.mjs,
+# dist/crypto-node.runtime-*.mjs, dist/monitor-*.mjs, the music-metadata
+# format-parser chunks, etc.). Those chunks live in /app/dist, not under
+# /app/dist/extensions/matrix, so Node's resolution walks straight to
+# /app/node_modules and never sees the plugin-local links upstream's
+# postinstall step creates under dist/extensions/matrix/node_modules/.
+# Symptom: "channel exited: Cannot find package 'matrix-js-sdk' imported
+# from /app/dist/send-<hash>.mjs" (all 4 matrix accounts crash-loop).
+# Fix: symlink through the plugin-local links (not the pnpm virtual-store
+# path directly, so this keeps working if the store's patch-hash suffix
+# changes on a future rebuild) so these packages also resolve from
+# top-level /app/node_modules.
+RUN mkdir -p /app/node_modules/@matrix-org && \
+    for pkg in matrix-js-sdk music-metadata @matrix-org/matrix-sdk-crypto-nodejs @matrix-org/matrix-sdk-crypto-wasm; do \
+      ln -sf "/app/dist/extensions/matrix/node_modules/$pkg" "/app/node_modules/$pkg"; \
+    done && \
+    node -e "require.resolve('matrix-js-sdk'); require.resolve('music-metadata'); require.resolve('@matrix-org/matrix-sdk-crypto-nodejs'); require.resolve('@matrix-org/matrix-sdk-crypto-wasm')"
+
 # XDG config symlinks (exec env sanitizer strips XDG_CONFIG_HOME, so tools
 # fall back to ~/.config/<app>). Git identity for agent commits.
 RUN mkdir -p /home/node/.config && \
