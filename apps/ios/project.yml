@@ -171,6 +171,7 @@ targets:
           - "$(PRODUCT_BUNDLE_IDENTIFIER).bgrefresh"
         NSLocalNetworkUsageDescription: OpenClaw discovers and connects to your OpenClaw gateway on the local network.
         NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
           NSAllowsArbitraryLoadsInWebContent: true
           NSAllowsLocalNetworking: true
         NSBonjourServices:
