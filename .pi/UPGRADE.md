@@ -1066,3 +1066,207 @@ transitive dependency, not declared directly in our `package.json` or any
 bundled extension's; upstream-owned, not introduced by our delta.
 `usr/bin/gh` (apt-installed): 2 HIGH, both the routine Go-stdlib-in-binary
 class seen every cycle.
+
+## v2026.10.5 upgrade notes (2026-10-19)
+
+### Strategy B stats
+
+- Incoming commits: 17,472 (v2026.9.3 → v2026.10.5). Upstream rewrote its
+  main history again (`git merge-base --is-ancestor v2026.9.3 v2026.10.5`
+  fails), so `BASE=v2026.9.3` was used directly, per the standing caveat.
+- Release-line check: `v2026.9.33` sorts *below* `v2026.10.5` but was
+  published between 10.3 and 10.4; its `CHANGELOG.md` lists only 9.x
+  entries, 10.5's lists 10.5 after 9.9 and omits 9.33 → 9.33 is the
+  extended-stable line, 10.5 is the feature mainline we track.
+- Custom delta: 14 files (3 additive, 1 zero-churn, 10 upstream-churned).
+  3-way apply: 2 clean, 6 conflicts, 1 intentionally dropped (see below).
+- Pre-flight found an uncommitted Ollama sidecar tuning in
+  `docker-compose.override.yml` (from 2026-09-12); committed it first so
+  the tree was clean.
+
+### Conflicts and resolutions
+
+- `extensions/diagnostics-otel/src/service-{metrics,recorders-tools,events}.ts`:
+  upstream restructured all three again. `createCounter`/`createHistogram`
+  are now positional `(name, description, unit?, buckets?)` with an
+  automatic `openclaw.` prefix (so our metric names are `"tool.calls"` /
+  `"tool.duration_ms"` in source, same wire names as before); recorders are
+  now methods on a returned object literal that read `runtime.*` instead
+  of destructured consts; the event dispatcher is a `DiagnosticHandlers`
+  map (optional keys, so adding `"tool.call"` to the payload union does not
+  break exhaustiveness) using `recorders.recordX.bind(recorders)`. The
+  3-way result was unusable; reset to upstream and re-ported by hand at
+  the same anchors. Note the whole extension now bundles into a shared
+  `dist/runtime-api-<hash>.mjs` chunk, so verify the port with
+  `grep -c recordToolCall /app/dist/runtime-api-*.mjs`, not under
+  `dist/extensions/diagnostics-otel/`.
+- `src/infra/diagnostic-events.ts`: upstream replaced several `*Event`
+  types with `(DiagnosticBaseEvent & *Fields)` intersections; kept
+  upstream's union and re-added `DiagnosticToolCallEvent`.
+- `embedded-agent-subscribe.handlers.tools.completion.ts`: import block
+  conflict only; took upstream's imports + our `emitDiagnosticEvent`.
+- `ui/src/styles/base.css`: took our blue values in all three hunks; also
+  overrode the new claw-dark-family `:root[data-theme="dark"]
+  --primary-hover: #c22e2e` → `#2563eb`. `--focus` is still the upstream
+  red (`rgba(255,92,92,.2)` dark / `rgba(189,69,49,.15)` light) — it was
+  never part of our patch; flagged, not changed.
+- `apps/ios/Sources/Gateway/GatewayConnectionController.swift`: **dropped.**
+  The delta we had been carrying since v2026.9.3 was a verbatim duplicate
+  of `GatewayTLSFingerprintProbe`, which upstream ships in its own
+  `GatewayTLSFingerprintProbe.swift` (two `private` classes with the same
+  name in different files compile, which is why nobody noticed). Upstream's
+  file taken as-is; the custom-file inventory is now 13 files.
+
+### Security review (Step 2) — clean
+
+- gitleaks on `custom..v2026.10.5` (17,420 commits): 94,824 raw hits, 115
+  after the `.i18n`/`.test.` filter, 104 after also dropping
+  `test-support|test-helpers|fixtures?/|/docs/|\.md$|/examples?/`. All 104
+  reviewed: `src/logging/redact-*-fixture.json` placeholder tokens (the
+  secret-redaction test corpus — worth adding `redact-.*-fixture` to the
+  filter), 48-char sha hashes in `ci-test-native-bun-qualification.json`
+  and `extensions/onnx/scripts/export-gliclass-instruct.py`, iOS unit-test
+  strings, one public GitHub App client ID. No real credential.
+- semgrep `p/security-audit`: 9 results in the whole tree, 5 in changed
+  files, all benign (loopback fetch in an e2e fixture; a nonce+origin
+  validated `postMessage` probe under a strict CSP; the sandboxed HTML
+  preview that JSON-escapes `<`).
+- Dockerfile/compose/scripts: digests re-pinned, no new apt packages,
+  no new remote fetches. New deps (`@babel/*`, `chrome-devtools-mcp`,
+  `import-meta-resolve`, `npm`, `esbuild`/`htmlparser2` moved to prod) are
+  canonical packages tied to visible features. Auth surface only
+  tightened (per-client auth-policy snapshots, operator-access gating,
+  redacted-secret config rejection).
+- **Behavioral change, mitigated:** the image `ENTRYPOINT` is now
+  `tini -s -- node /app/docker-entrypoint.mjs`, which runs
+  `openclaw doctor --fix --non-interactive` on every image swap before
+  exec'ing the gateway. One of Doctor's repairs can npm/ClawHub-install a
+  plugin that is configured but absent from the image. Our override now
+  sets `OPENCLAW_UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR=1` and
+  `OPENCLAW_NO_AUTO_UPDATE=1` (gateway/node-host self-update is off by
+  default but belt-and-braces). Do NOT override the entrypoint: the
+  boot-time Doctor is what performed this cycle's schema migrations
+  (agent DB 19→25, shared state 16→20, Matrix account SQLite v13→v20,
+  plaintext model credential → agent SQLite, implicit primary model →
+  explicit `agents.defaults.model.primary`).
+
+### gogcli 0.39.1 → 0.45.0, goplaces 0.4.9 → 0.4.13
+
+Both carry security fixes this time: gogcli 0.41 retains patched gRPC
+(GHSA-2v4p-qf9q-27wj), 0.44 built with patched Go 1.27.2; goplaces
+0.4.10/0.4.11 refuse cross-origin API redirects and redact API keys from
+errors, 0.4.12 Go stdlib fixes. Rest is feature work. `goplaces` now
+publishes an `ASSET-INVENTORY.json` alongside the archives; the
+`find -name` extraction is unaffected.
+
+### Deploy gotcha 1: stale Matrix `crypto-idb-snapshot.json.lock` files
+
+**Symptom:** all four Matrix accounts `error:Matrix startup aborted,
+running, disconnected, health:error` right after deploy, Telegram fine,
+gateway `healthy`. The abort reason is only in the gateway log *file*
+(`/tmp/openclaw/openclaw-<date>.log` inside the container, not stdout):
+`[IdbPersistence] Failed to restore IndexedDB snapshot from SQLite: Error:
+file lock timeout for .../matrix/accounts/<acct>/<server>/<id>/crypto-idb-snapshot.json`.
+
+**Cause:** four zero-byte `crypto-idb-snapshot.json.lock` files dated
+2026-07-27 (the v2026.7.1 cycle) had been sitting next to the
+`.migrated` snapshots. Older releases ignored them; 10.5's `file-lock`
+implementation waits on them and times out.
+
+**Fix:** with no process holding them, move them aside and restart:
+
+```bash
+sudo find /home/max/.openclaw/matrix/accounts -maxdepth 4 \
+  -name crypto-idb-snapshot.json.lock -size 0 \
+  -exec sh -c 'mv "$1" "$1.stale-$(date +%Y%m%d)"' _ {} \;
+cd /home/max/Projects/openclaw && sudo -u max docker compose restart openclaw-gateway
+```
+
+All four accounts reached `running, connected, health:healthy` on the next
+start. The `.lock.stale-20261019` copies are safe to delete.
+
+Pre-flight tip: `find ~/.openclaw -name '*.lock' -size 0 -mtime +30`
+before deploying.
+
+### Deploy gotcha 2: `proxy_attribution_required` (HTTP 403) on every
+gateway-authenticated route
+
+**Symptom:** `https://max.shushu.be/` (and `/readyz`, hooks, Control UI)
+return `403 {"error":{"type":"proxy_attribution_required"}}` while
+channels are healthy. Gateway log: `observed unattributable proxy-shaped
+traffic from 172.19.0.6`.
+
+**Cause:** 10.5 fails closed when a request arrives from a
+`gateway.trustedProxies` address and the `X-Forwarded-For` chain, after
+stripping every trusted hop, leaves no client (`src/gateway/net.ts
+resolveClientIp`; `X-Real-IP` is only honored with
+`gateway.allowRealIpFallback=true`, which the security audit flags). Our
+config trusted all of `172.17–19.0.0/16`, i.e. every container, and the
+ingress is `shushu-edge-router` (TLS SNI passthrough, 172.19.0.3) →
+`max-nginx` (172.19.0.6) → gateway. max-nginx's gateway `location /` only
+set `X-Real-IP`; after adding `X-Forwarded-For` the chain was
+`172.19.0.3` — itself trusted — so still unattributable.
+
+**Fix (two files outside this repo + config):**
+
+1. `~/Projects/max-nginx/nginx/nginx.conf`, gateway `location /`: added
+   `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` and
+   `X-Forwarded-Proto $scheme;` (the grafana/matrix locations already had
+   them). Re-rendered the template in place and reloaded:
+   `docker exec max-nginx sh -c '/docker-entrypoint.d/20-envsubst-on-templates.sh; nginx -t && nginx -s reload'`.
+2. `~/Projects/max-nginx/docker-compose.yml`: pinned
+   `networks.openclaw_default.ipv4_address: 172.19.0.6` (its existing
+   address) so the next point survives container recreation.
+3. `~/.openclaw/openclaw.json`: `gateway.trustedProxies` →
+   `["172.19.0.6/32"]` (backup at
+   `openclaw.json.bak-pre-trustedproxies-20261019`), then
+   `docker compose restart openclaw-gateway`.
+
+Now the edge router (172.19.0.3) is the attributed client for all external
+traffic (the gateway's per-IP auth rate limit therefore sees one IP for
+everything behind Tailscale — fine for a single-operator box), fritzbridge
+(172.19.0.9) and host-local `127.0.0.1:18789` callers are ordinary
+direct clients, and `max.shushu.be` serves the Control UI again. Real
+client IPs would need PROXY protocol from the edge router, which would
+also have to be enabled on `fritz-nginx` — not done.
+
+**Keep in sync:** the `/32` in `openclaw.json` and the `ipv4_address` in
+max-nginx's compose must match.
+
+### Memory reindex
+
+`Vector search: paused` on all four agents after deploy (reason this time:
+`index chunking implementation changed (code: chunking_version)`).
+`openclaw memory status --index --agent <a>` for main/jarvis/sensei/nemo
+took 6 minutes total (vs. ~90 last time) thanks to the stored embedding
+cache plus `OLLAMA_NUM_PARALLEL=2`; all four now `Dirty: no`, vector
+search ready.
+
+### Other post-deploy observations
+
+- `openclaw-openclaw-cli-1` is `unhealthy` with "cannot verify Gateway
+  ownership from this process (different PID namespace)". Same known
+  limitation as before (see "doctor --fix needs gateway stopped"); adding
+  `pid: "service:openclaw-gateway"` to the cli service in the override
+  would likely fix it — not done this cycle.
+- Doctor's remaining notices, all informational: 2 deferred historical
+  transcript imports (`openclaw doctor --session-sqlite dry-run
+  --session-sqlite-all-agents`), the bundled `github` plugin is not in
+  `plugins.allow` (set `plugins.entries.github.enabled=false` to silence),
+  and `openclaw update cleanup --dry-run` to retire the pre-migration
+  `*.pre-startup-migration-*.bak` SQLite copies once the upgrade is
+  trusted. Pre-upgrade tarball of the whole state dir:
+  `~/.openclaw/backups/pre-upgrade-2026.10.5.tar.gz` (372 MB).
+- 42 `Error decrypting event ... The sender's device has not sent us the
+  keys` lines on Matrix start are all for June-2026 backlog events —
+  pre-existing, same as prior cycles.
+- Trivy: Debian baseline unchanged (127 HIGH / 5 CRITICAL, all
+  `affected`/`fix_deferred`/`will_not_fix`); the 5 Node HIGHs are inside
+  npm's own vendored tree (`/app/node_modules/.pnpm/npm@12.2.0/...` — npm
+  is now a runtime dependency — and corepack's pnpm), not `/app`'s own
+  pins (`/app` undici is 8.11.2, fixed); `usr/bin/gh` has the usual
+  Go-stdlib class. gogcli/goplaces binaries: zero findings.
+- Pushing this repo: `origin` is an HTTPS URL, so the SSH-key push pattern
+  needs a URL rewrite:
+  `sudo bash -c 'cd /home/max/Projects/openclaw && GIT_SSH_COMMAND="ssh -i /home/patrick/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new" git -c url."git@github.com:".insteadOf="https://github.com/" push origin custom --force-with-lease'`
+  then `sudo find .git -user root -exec chown max:max {} +`.

@@ -209,7 +209,9 @@ changelog/fragments/
 .amp/portals/
 .openclaw-config-doc-cache/
 openclaw-path-alias-*/
-/.pi/
+# local: upstream ignores /.pi/; keep the fork's upgrade runbook tracked
+/.pi/*
+!/.pi/UPGRADE.md
 /C:\\openclaw/
 *.log
 *.tmp
