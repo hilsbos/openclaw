@@ -17,6 +17,14 @@ services:
       XDG_CONFIG_HOME: ${XDG_CONFIG_HOME}
       FRITZBRIDGE_API_TOKEN: ${FRITZBRIDGE_API_TOKEN}
       PATH: /home/linuxbrew/.linuxbrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # v2026.10.5+: upgrades are image rebuilds reviewed in git, never in-place.
+      # Disable gateway/node-host self-update and update checks.
+      OPENCLAW_NO_AUTO_UPDATE: "1"
+      # v2026.9.6+: the upstream entrypoint runs `doctor --fix` on every image
+      # swap. One of its repairs can npm/ClawHub-install any plugin that is
+      # configured but not present in the image. Defer that so a stale
+      # plugins.entries key never pulls unreviewed code at boot.
+      OPENCLAW_UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR: "1"
     ports: !override
       - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "127.0.0.1:${OPENCLAW_BRIDGE_PORT:-18790}:18790"
