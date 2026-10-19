@@ -86,6 +86,7 @@ export function createDiagnosticsEventHandler(params: {
     "tool.execution.error": (evt, metadata, privateData) =>
       recorders.recordToolExecutionFinished(evt, metadata, privateData.toolContent),
     "tool.execution.blocked": recorders.recordToolExecutionBlocked.bind(recorders),
+    "tool.call": recorders.recordToolCall.bind(recorders),
     "skill.used": recorders.recordSkillUsed.bind(recorders),
     "exec.process.completed": recorders.recordExecProcessCompleted.bind(recorders),
     "log.record": (evt, metadata) => recordLogEvent?.(evt, metadata),

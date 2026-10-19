@@ -752,6 +752,17 @@ type DiagnosticTelemetryExporterEvent = DiagnosticBaseEvent & {
   errorCategory?: string;
 };
 
+export type DiagnosticToolCallEvent = DiagnosticBaseEvent & {
+  type: "tool.call";
+  sessionKey?: string;
+  sessionId?: string;
+  channel?: string;
+  toolName: string;
+  toolCallId?: string;
+  durationMs?: number;
+  isError: boolean;
+};
+
 export type DiagnosticEventPayload =
   | DiagnosticGatewayRpcEvent
   | (DiagnosticBaseEvent & DiagnosticRuntimeMeasurementFields)
@@ -810,7 +821,8 @@ export type DiagnosticEventPayload =
   | DiagnosticSecurityEvent
   | DiagnosticTelemetryExporterEvent
   | (DiagnosticBaseEvent & DiagnosticAsyncQueueDroppedFields)
-  | DiagnosticFailoverEvent;
+  | DiagnosticFailoverEvent
+  | DiagnosticToolCallEvent;
 
 type DiagnosticNonSecurityEventPayload = Exclude<DiagnosticEventPayload, DiagnosticSecurityEvent>;
 

@@ -167,6 +167,8 @@ export function createDiagnosticsMetrics(
       "Talk audio frame byte lengths",
       "By",
     ),
+    toolCallCounter: createCounter("tool.calls", "Tool calls by tool name and outcome"),
+    toolCallDurationHistogram: createHistogram("tool.duration_ms", "Tool execution duration"),
     runAttemptCounter: createCounter("run.attempt", "Run attempts"),
     toolLoopCounter: createCounter("tool.loop", "Detected repetitive tool-call loop events"),
     skillUsedCounter: createCounter("skill.used", "Skills used by agent runs"),
