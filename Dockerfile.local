@@ -11,8 +11,8 @@
 # gh stays on apt for auto security updates on every rebuild.
 
 ARG BASE_IMAGE=openclaw-base:latest
-ARG GOGCLI_VERSION=0.45.0
-ARG GOPLACES_VERSION=0.4.13
+ARG GOGCLI_VERSION=0.46.0
+ARG GOPLACES_VERSION=0.4.14
 
 FROM ${BASE_IMAGE}
 
