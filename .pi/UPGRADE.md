@@ -1339,3 +1339,30 @@ unaffected.
   introduced this cycle.
 - `openclaw-openclaw-cli-1` still `unhealthy` (PID-namespace ownership
   check), unchanged.
+
+### Post-deploy gotcha: pinned max-nginx IP lost the restart race (2026-10-22)
+
+The first `dockerd` restart after the 10.5 cycle (an apt `docker-ce`
+upgrade) brought every container up in arbitrary order; `continuwuity`
+was dynamically assigned `172.19.0.6` before `max-nginx` started, so
+`max-nginx` failed with `failed to set up container networking: Address
+already in use` and stayed down (ingress for max/matrix/grafana gone).
+Docker IPAM allocates dynamic addresses from the bottom of the subnet, so
+any pin in the low range will collide eventually. Moved the pin to
+`172.19.0.250` (needs ~248 containers before dynamic allocation reaches
+it) in both places that must stay in sync:
+
+- `~/Projects/max-nginx/docker-compose.yml` → `ipv4_address: 172.19.0.250`
+  (backup `docker-compose.yml.bak-20261022`), then `docker compose up -d`.
+- `~/.openclaw/openclaw.json` → `gateway.trustedProxies: ["172.19.0.250/32"]`
+  (backup `openclaw.json.bak-pre-trustedproxies-20261022`), then
+  `docker compose restart openclaw-gateway`.
+
+Verified `max.shushu.be/readyz` 200, zero `unattributable` log lines, 8/8
+channels healthy. Note `docker compose restart openclaw-gateway` now takes
+~90 s because the gateway's shutdown drain budget is 315 s and channels
+take a while to close cleanly.
+
+Also: `openclaw-openclaw-cli-1` has `restart: no`, so it does not return
+after a dockerd restart or reboot; `docker start openclaw-openclaw-cli-1`
+if you want it around (it is unhealthy by design anyway).
