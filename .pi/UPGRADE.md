@@ -1270,3 +1270,72 @@ search ready.
   needs a URL rewrite:
   `sudo bash -c 'cd /home/max/Projects/openclaw && GIT_SSH_COMMAND="ssh -i /home/patrick/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new" git -c url."git@github.com:".insteadOf="https://github.com/" push origin custom --force-with-lease'`
   then `sudo find .git -user root -exec chown max:max {} +`.
+
+## v2026.10.6 upgrade notes (2026-10-22)
+
+### Strategy A stats
+
+- Incoming commits: 294 (v2026.10.5 → v2026.10.6). For once upstream did
+  NOT rewrite history: `git merge-base --is-ancestor v2026.10.5 v2026.10.6`
+  passes, so a literal `git rebase v2026.10.6` of our 7 commits applied
+  with zero conflicts. Custom delta unchanged at 13 files.
+- Why this release matters: upstream now requires Node 24.22.1+ (the
+  October 2026 Node.js security releases reject TLS chains signed with
+  compromised certificate keys). The Dockerfile re-pins
+  `node:24.22.1-bookworm{,-slim}` by digest; the 10.5 image ran 24.21.0.
+  Verified `node --version` = v24.22.1 in the built image.
+
+### gogcli 0.45.0 → 0.46.0, goplaces 0.4.13 → 0.4.14
+
+Both are Go 1.27.3 rebuilds for GO-2026-6809 (crypto/x509 certificate
+validation). gogcli also adds `gog auth rekey`, a `GOG_GOOGLE_API_BASE_URL`
+relay option (refuses cross-origin redirects, sends no credentials) and
+Gmail forward formatting. goplaces is security-only. `find -name` extraction
+unaffected.
+
+### Security review (Step 2) — clean
+
+- gitleaks on `custom..v2026.10.6`: 181 raw hits, 0 after the standard
+  filter (`.i18n|.test.|test-support|test-helpers|fixtures?/|/docs/|\.md$|
+  /examples?/|redact-.*-fixture`).
+- semgrep `p/security-audit`: the same 9 baseline results as last cycle,
+  0 in changed files.
+- `Dockerfile`: only the Node digest re-pin. `docker-entrypoint.mjs`: same
+  boot-time `doctor --fix --non-interactive` flow, now passes an
+  `OPENCLAW_IMAGE_ACTIVATION_CAPTURE_MARKER` env so Doctor skips its full
+  pre-repair capture on plain container stop/start (still captures on a new
+  image). Signal listeners are now removed after Doctor exits. No new remote
+  fetches; `api.gmi-serving.com` is a new provider model definition.
+- Root `package.json`: Node engine floor 24.22.1/26.12.1, pnpm 12.15.0,
+  new `release:*` scripts, one new plugin-sdk export. No new runtime deps.
+- Commit-message grep: 8 hits, all routine (OAuth refresh fence, MCP auth
+  error text, scheduled follow-up authority).
+
+### Deploy
+
+- Boot-time Doctor ran cleanly; pre-repair capture retained at
+  `~/.openclaw.update-captures/doctor-<id>/`. No schema migrations this
+  time. Same informational notices as 10.5 (github plugin not in
+  `plugins.allow`, 2 deferred historical transcript imports) plus a new
+  "newest backup is more than 14 days old" nudge — the pre-upgrade tarball
+  `~/.openclaw/backups/pre-upgrade-2026.10.6.tar.gz` (544 MB) covers it,
+  but `openclaw backup enable --repository <dir>` would silence it.
+- New `[state/agent-admission] Skipped openclaw-agent.sqlite: database is
+  not a configured target` line at startup refers to
+  `agents/openclaw/agent/openclaw-agent.sqlite` (688 KB, an agent id that
+  is not configured — likely a stray from a past CLI run without
+  `--agent`). Harmless; left in place.
+- 11 plugins loaded; all 4 Matrix + 4 Telegram accounts `running,
+  connected, health:healthy` on first start — no lock-file or
+  proxy-attribution issues this cycle (both fixes from 10.5 held).
+- `grep -c recordToolCall /app/dist/runtime-api-*.mjs` → 2 in one chunk
+  (OTel port intact).
+- Memory: `Dirty: yes` on all four agents after deploy; `memory status
+  --index` for main/jarvis/sensei/nemo took 75 s total.
+- Trivy: Debian baseline unchanged. Node findings: 4 inside npm's own
+  vendored tree (`.pnpm/npm@12.2.0/...`: brace-expansion,
+  http-cache-semantics, undici 6.x) and `markdown-it@15.0.2` (CVE-2026-111758,
+  fixed in 15.0.3) which is upstream's pin — already at 15.0.2 in 10.5, not
+  introduced this cycle.
+- `openclaw-openclaw-cli-1` still `unhealthy` (PID-namespace ownership
+  check), unchanged.
