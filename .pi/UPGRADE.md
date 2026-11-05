@@ -1438,7 +1438,15 @@ schema migrations. `openclaw.json` was not modified during the boot.
   this cycle.
 - **Step 6 change:** `openclaw memory status` no longer works against a running
   gateway ("requires exclusive offline state ownership"), so the memory check
-  and any `--index` now need the gateway stopped. Not run this cycle.
+  and any `--index` now need the gateway stopped and a one-off container using
+  the gateway's own mounts, env and `--network openclaw_default` (for Ollama).
+- **Plan real downtime for the reindex.** All agents came up `Dirty: yes`,
+  `Vector search: paused`. Unlike 10.5/10.6 (6 min / 75 s) this was a slow,
+  full-looking embed on CPU, ~20-70 requests/min: jarvis ~8 min, main 16 min,
+  sensei 13 min, nemo 9 min, vero 29 s, plus one 10-minute main run lost to a
+  per-agent timeout. Gateway down 14:57-15:55 UTC, 58 min. Why the embedding
+  cache did not help is not established. Don't cap per-agent runs at 10 min, and
+  don't start this outside a window that can absorb an hour.
 - `gogcli/keyring/.lock` matches the stale-lock pre-flight `find` but is gog's
   own lock file. Leave it.
 - Trivy: Debian 107 HIGH / 5 CRITICAL. Node: `dompurify` 3.4.16 CRITICAL
