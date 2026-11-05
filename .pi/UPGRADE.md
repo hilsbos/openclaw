@@ -1366,3 +1366,86 @@ take a while to close cleanly.
 Also: `openclaw-openclaw-cli-1` has `restart: no`, so it does not return
 after a dockerd restart or reboot; `docker start openclaw-openclaw-cli-1`
 if you want it around (it is unhealthy by design anyway).
+
+## v2026.11.1 upgrade notes (2026-11-05)
+
+### Crossed release lines: 10.4-10.9 are NOT ancestors of 10.10/11.1
+
+`v2026.10.6` is not an ancestor of `v2026.11.1`; they diverge at a 2026-10-09
+commit (769 commits on the 10.6 side, 5,092 on the 11.1 side). The changelog
+index at 10.10/11.1 goes 10.10 -> 10.10-beta.* -> 10.3, skipping 10.4-10.9,
+while 10.9's own index lists 10.5-10.9. `v2026.9.34-36` remain the
+extended-stable line. Hence the unusually large tree diff (25,989 files,
++1.6M/-1.1M lines) for a two-week gap. Used `BASE=v2026.10.6` per the standing
+caveat.
+
+### Strategy B stats
+
+- Custom delta 13 files: 3 additive, 3 zero-churn, 7 upstream-churned. All 7
+  applied cleanly with `git apply --3way`; zero conflicts.
+- gogcli 0.46.0 -> 0.47.1 (eMudhra chain rejection in tracking worker, headless
+  Linux auth fix, narrowed Calendar reauth, Gmail features). goplaces unchanged.
+
+### Security review (Step 2)
+
+- gitleaks `custom..v2026.11.1`: 24,199 raw, 0 after the standard filter.
+- semgrep `p/security-audit`: 11 results, 3 in changed files, all benign (e2e
+  loopback fetch, parity report generator, plugin-auth probe whose
+  `targetOrigin` must equal its parsed `.origin`). 96 parse errors, so coverage
+  was partial.
+- Diff review was targeted only (~1.1M lines even after excluding tests/docs):
+  Dockerfile, entrypoint, compose (no change), root `package.json`, grep for
+  eval/obfuscation/curl-pipe-shell/new hosts. Not a line-by-line review.
+- `Dockerfile`: bun 1.4.2 -> 1.4.4 digest re-pin, one new COPY. No new apt
+  packages or remote fetches. Node stays 24.22.1 although the `package.json`
+  engine floor dropped to 24.16.0 (the 10.6 line's floor was never on this line).
+- New deps: `@openclaw/proc-safe`, `@resvg/resvg-js`, `pg`, `@types/pg`.
+  Removed: `koffi`.
+- New hosts: `mcp.openclaw.ai` (default for the `mcp-relay` extension),
+  `dev.meta.ai` (install hint string in `extensions/meta/muse-login.ts`, printed,
+  not executed), `api.together.ai`, `docs.together.ai`.
+
+### Deploy gotcha: agent database degraded after first boot
+
+First boot after the image swap left one agent (vero) degraded while the others
+were fine:
+
+```
+[state/agent-admission] agent database remains degraded agentId=vero
+reason="prepared model runtime owner is stale after config publication"
+repairHint="Sessions remain unavailable. Stop the Gateway, run openclaw doctor --fix ..."
+```
+
+followed by `AgentDatabaseAdmissionError` from memory-core every 30 s. It does
+not self-heal. The gateway container reports `healthy` and the channels
+`connected`, so check for it explicitly:
+`docker logs openclaw-openclaw-gateway-1 2>&1 | grep -E "remains degraded|AgentDatabaseAdmissionError"`.
+
+**Fix:** a plain `docker compose restart openclaw-gateway` cleared it (0
+degraded lines afterwards); doctor --fix was not needed. Root cause not
+established; it looks like a race during the first boot that also performs
+schema migrations. `openclaw.json` was not modified during the boot.
+
+### Deploy notes
+
+- Boot-time Doctor migrated agent DBs v25 -> v27 and Matrix account SQLite (v22
+  among others), with `*.pre-startup-migration-659d6b71-*.bak` copies per agent.
+- `docker compose up -d` was used instead of `down` + `up`: it recreates the
+  changed containers and leaves `openclaw_default`, which max-nginx's pinned IP
+  is attached to, in place.
+- **Do not run the Pre-flight/Strategy B `git clean -fd` blindly:** the untracked
+  `.env.bak-pre-vero-*-20261028` files in the repo root would be deleted. Skipped
+  this cycle.
+- **Step 6 change:** `openclaw memory status` no longer works against a running
+  gateway ("requires exclusive offline state ownership"), so the memory check
+  and any `--index` now need the gateway stopped. Not run this cycle.
+- `gogcli/keyring/.lock` matches the stale-lock pre-flight `find` but is gog's
+  own lock file. Leave it.
+- Trivy: Debian 107 HIGH / 5 CRITICAL. Node: `dompurify` 3.4.16 CRITICAL
+  (GHSA-cg2g-xh64-v4q7, fixed 3.4.17) and HIGH, `joi` 18.2.9 HIGH, `undici` 8.11.2
+  HIGH, `markdown-it` 15.0.2 HIGH, all upstream pins; `npm@12.2.0` vendored
+  `undici`/`brace-expansion` HIGH. Reachability not assessed.
+- Rollback: `~/.openclaw/backups/pre-upgrade-2026.10.6-to-2026.11.1.tar.gz`
+  (518 MB, taken with the gateway running) and `openclaw:rollback-2026.10.6` /
+  `openclaw-base:rollback-2026.10.6`. Schema changed, so images alone are not
+  enough.
