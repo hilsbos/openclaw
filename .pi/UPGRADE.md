@@ -1405,14 +1405,15 @@ caveat.
   `dev.meta.ai` (install hint string in `extensions/meta/muse-login.ts`, printed,
   not executed), `api.together.ai`, `docs.together.ai`.
 
-### Deploy gotcha: agent database degraded after first boot
+### Deploy gotcha: agent database degraded at boot (startup race)
 
-First boot after the image swap left one agent (vero) degraded while the others
-were fine:
+Some boots left one agent (vero) degraded while the others were fine. Telegram
+shows typing but the agent never replies:
 
 ```
 [state/agent-admission] agent database remains degraded agentId=vero
 reason="prepared model runtime owner is stale after config publication"
+  (or: "prepared model runtime publication was superseded for .../agents/main/agent")
 repairHint="Sessions remain unavailable. Stop the Gateway, run openclaw doctor --fix ..."
 ```
 
@@ -1420,11 +1421,29 @@ followed by `AgentDatabaseAdmissionError` from memory-core every 30 s. It does
 not self-heal. The gateway container reports `healthy` and the channels
 `connected`, so check for it explicitly:
 `docker logs openclaw-openclaw-gateway-1 2>&1 | grep -E "remains degraded|AgentDatabaseAdmissionError"`.
+fritzmonitor's `AgentDatabaseUnavailable` alert fires on the same log lines.
 
-**Fix:** a plain `docker compose restart openclaw-gateway` cleared it (0
-degraded lines afterwards); doctor --fix was not needed. Root cause not
-established; it looks like a race during the first boot that also performs
-schema migrations. `openclaw.json` was not modified during the boot.
+**Cause:** not the database, so ignore the doctor hint. The Gateway's full startup
+refresh (`sidecars.model-runtime`) cancels a deferred agent's scoped model
+refresh if that one started first, and admission treated the cancellation as
+terminal. Across 7 boots on 2026.11.1 the order decided the result: 4 failed,
+including the nightly 04:30 restart and two manual restarts in a row. A plain
+restart is NOT a reliable fix. Slow `sidecars.worker-environments` (313-390 ms vs
+~157 ms) went with the failures; why it varies is not established, nor why only
+vero is deferred.
+
+**Fix:** local commit "retry agent startup when the full model refresh cancels
+it" sends both errors to the existing publication retry. Verified 2026-11-06:
+4 of 4 boots recovered, one after a real `superseded; retrying` at 294 ms.
+
+**On upgrade:** keep this commit until upstream handles both errors. Upstream
+`eb90c067a62` (refs #190307) adds a retry, but `isPreparedModelRuntimePluginLifecycleFailure`
+doesn't match the plain `owner is stale` Error. The patch matches message text,
+so if a rebase conflicts here or upstream rewords those messages, recheck it.
+
+**Testing here:** don't run a full-project `tsc --noEmit` on this host (29.5 GB
+RSS caused a global OOM kill on 2026-11-06). Run focused vitest files in a
+`git archive` copy instead.
 
 ### Deploy notes
 
