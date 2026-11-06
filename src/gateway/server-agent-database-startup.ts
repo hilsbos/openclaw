@@ -1,5 +1,6 @@
 import { listAgentIds, resolveAgentDir } from "../agents/agent-scope-config.js";
 import { resolveAuthProfileDatabasePath } from "../agents/auth-profiles/sqlite.js";
+import { isPreparedModelRuntimePluginLifecycleFailure } from "../agents/prepared-model-runtime.errors.js";
 import { getRuntimeConfigSourceSnapshot } from "../config/runtime-snapshot.js";
 import {
   isConfiguredAgentDatabaseTarget,
@@ -26,6 +27,23 @@ function assertAgentDatabaseConfiguration(
   if (paths.some((pathname) => !isConfiguredAgentDatabaseTarget(targets, agentId, pathname))) {
     throw new Error(`Agent ${agentId} database configuration changed during startup inspection`);
   }
+}
+
+/**
+ * The Gateway's full startup refresh cancels an in-flight scoped publication. That loss
+ * says nothing about the database, so it must reach the bounded publication retry.
+ * Matches by message too: the stale path throws a plain Error, and refresh failures can
+ * be re-created as snapshots that lose their class. See upstream #190307 and eb90c067a62.
+ */
+function isStartupModelRuntimeSupersession(error: unknown): boolean {
+  if (isPreparedModelRuntimePluginLifecycleFailure(error)) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : "";
+  return (
+    message === "prepared model runtime owner is stale after config publication" ||
+    message.startsWith("prepared model runtime publication was superseded")
+  );
 }
 
 /** Finish only the deferred agent's preparation before its admission owner recovers it. */
@@ -124,7 +142,11 @@ export function activateGatewayAgentDatabaseStartup(params: {
       runWithSpawnBroker(broker, async () => {
         phase("secrets");
         const [
-          { refreshPreparedModelRuntimeSnapshots, getPreparedModelRuntimeSnapshot },
+          {
+            refreshPreparedModelRuntimeSnapshots,
+            getPendingPreparedModelRuntimeReplacement,
+            getPreparedModelRuntimeSnapshot,
+          },
           { listConfiguredOwnerInputs },
           {
             getActiveSecretsRuntimeSnapshot,
@@ -198,22 +220,31 @@ export function activateGatewayAgentDatabaseStartup(params: {
         assertPreparationCurrent();
         phase("models");
         const pluginMetadataSnapshot = params.getPluginMetadataSnapshot();
-        await withPluginRuntimeRegistryScope(params.getPluginRegistry(), () =>
-          refreshPreparedModelRuntimeSnapshots(cfg, {
-            agentIds,
-            catalogMode: "static",
-            allowGatewaySubagentBinding: true,
-            ...(pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {}),
-            isPublicationCurrent: () => {
-              try {
-                assertPreparationCurrent();
-                return true;
-              } catch {
-                return false;
-              }
-            },
-          }),
-        );
+        try {
+          await withPluginRuntimeRegistryScope(params.getPluginRegistry(), () =>
+            refreshPreparedModelRuntimeSnapshots(cfg, {
+              agentIds,
+              catalogMode: "static",
+              allowGatewaySubagentBinding: true,
+              ...(pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {}),
+              isPublicationCurrent: () => {
+                try {
+                  assertPreparationCurrent();
+                  return true;
+                } catch {
+                  return false;
+                }
+              },
+            }),
+          );
+        } catch (error) {
+          if (!isStartupModelRuntimeSupersession(error)) {
+            throw error;
+          }
+          // Let the superseding refresh settle; a failure there is judged by the next attempt.
+          await getPendingPreparedModelRuntimeReplacement()?.catch(() => {});
+          throw new AgentDatabaseStartupSupersededError(agentId, "startup");
+        }
         preparedInput = listConfiguredOwnerInputs(cfg, undefined, true).find(
           (input) => input.agentId === agentId,
         );

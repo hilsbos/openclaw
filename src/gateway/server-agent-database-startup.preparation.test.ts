@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { withinTest } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { PreparedModelRuntimePublicationSupersededError } from "../agents/prepared-model-runtime.errors.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import {
   readAgentDatabaseAdmissionRefusal,
@@ -20,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   opened: vi.fn(),
   refreshSecrets: vi.fn(),
   refreshModels: vi.fn(),
+  pendingReplacement: vi.fn(),
   snapshot: vi.fn(),
   revision: vi.fn(),
   info: vi.fn(),
@@ -55,6 +57,7 @@ vi.mock("./server-startup-session-migration.js", () => ({
 // mock-isolation: Model preparation stays observable without loading provider plugins.
 vi.mock("../agents/prepared-model-runtime.js", () => ({
   refreshPreparedModelRuntimeSnapshots: mocks.refreshModels,
+  getPendingPreparedModelRuntimeReplacement: mocks.pendingReplacement,
   getPreparedModelRuntimeSnapshot: () => ({}),
 }));
 // mock-isolation: Configured model inputs are not the behavior under test.
@@ -582,6 +585,68 @@ it("fails admission after four continuously superseded publications", async ({ s
     expect(mocks.opened).toHaveBeenCalledTimes(1);
     expect(mocks.migrate).toHaveBeenCalledTimes(1);
     expect(mocks.info).not.toHaveBeenCalledWith(recoveredMessage, expect.anything());
+  });
+});
+
+it.for([
+  ["stale owner", new Error("prepared model runtime owner is stale after config publication")],
+  [
+    "superseded publication",
+    new PreparedModelRuntimePublicationSupersededError(
+      "prepared model runtime publication was superseded for /agents/main/agent",
+    ),
+  ],
+  [
+    "superseded snapshot",
+    new Error("prepared model runtime publication was superseded for /agents/main/agent"),
+  ],
+] as const)(
+  "retries publication after the full startup refresh cancels it: %s",
+  async ([, cancellation], { signal }) => {
+    const fleet = createFleet(["idle"]);
+    const replacementSettled = createDeferredCore();
+    mocks.pendingReplacement.mockReturnValueOnce(replacementSettled.promise);
+    mocks.refreshModels.mockRejectedValueOnce(cancellation);
+    await fleet.run(async (admission) => {
+      fleet.inspect(0);
+      await vi.waitFor(() => expect(mocks.pendingReplacement).toHaveBeenCalledTimes(1));
+      // The retry must not race the refresh that cancelled this attempt.
+      expect(mocks.refreshModels).toHaveBeenCalledTimes(1);
+      replacementSettled.resolve();
+      await withinTest(admission.waitForAgentPreparation("idle", fleet)!, signal);
+      expect(readAgentDatabaseAdmissionRefusal("idle", fleet)).toBeUndefined();
+      expect(mocks.refreshModels).toHaveBeenCalledTimes(2);
+      expect(mocks.opened).toHaveBeenCalledTimes(1);
+      expect(mocks.info).toHaveBeenCalledWith(recoveredMessage, expect.anything());
+    });
+  },
+);
+
+it("retries even when the superseding refresh itself fails", async ({ signal }) => {
+  const fleet = createFleet(["idle"]);
+  mocks.pendingReplacement.mockReturnValueOnce(Promise.reject(new Error("replacement failed")));
+  mocks.refreshModels.mockRejectedValueOnce(
+    new Error("prepared model runtime owner is stale after config publication"),
+  );
+  await fleet.run(async (admission) => {
+    fleet.inspect(0);
+    await withinTest(admission.waitForAgentPreparation("idle", fleet)!, signal);
+    expect(readAgentDatabaseAdmissionRefusal("idle", fleet)).toBeUndefined();
+    expect(mocks.refreshModels).toHaveBeenCalledTimes(2);
+  });
+});
+
+it("does not retry unrelated model preparation failures", async ({ signal }) => {
+  const fleet = createFleet(["idle"]);
+  mocks.refreshModels.mockRejectedValueOnce(new Error("provider catalog exploded"));
+  await fleet.run(async (admission) => {
+    fleet.inspect(0);
+    await withinTest(admission.waitForAgentPreparation("idle", fleet)!, signal);
+    expect(readAgentDatabaseAdmissionRefusal("idle", fleet)?.code).toBe(
+      "agent-database-inspection-failed",
+    );
+    expect(mocks.refreshModels).toHaveBeenCalledTimes(1);
+    expect(mocks.pendingReplacement).not.toHaveBeenCalled();
   });
 });
 
