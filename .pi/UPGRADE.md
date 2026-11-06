@@ -1445,6 +1445,41 @@ so if a rebase conflicts here or upstream rewords those messages, recheck it.
 RSS caused a global OOM kill on 2026-11-06). Run focused vitest files in a
 `git archive` copy instead.
 
+### Post-deploy gotcha: cron jobs refused with no inference account
+
+Legacy agent-turn cron jobs fail in about 60 ms on their first scheduled run
+after the upgrade, so this can surface a day later:
+
+```
+Automation has no recorded inference account
+```
+
+This is upstream behaviour (`docs/automation/cron-jobs/payloads.md`, "Inference
+account continuity"), and doctor will not infer the account. Jobs created on
+11.1+ capture a binding automatically. Memory Dreaming and heartbeat are not
+affected. Bind each job explicitly:
+
+```
+openclaw automations edit <jobId> --agent <agentId> --model <provider/model>@<profileId>
+```
+
+`--agent` is required for a job with no explicit agent in a multi-agent setup.
+Check for gaps by looking for jobs with no `inferenceBinding` in
+`cron_jobs.job_json` (`state/openclaw.sqlite`). On 2026-11-06 all 9 enabled agent
+jobs were bound to `anthropic:console`; the 12 disabled jobs were left unbound
+and need the same edit if re-enabled.
+
+What a bound job gives up:
+
+- **No cross-provider fallback:** a Grok fallback is refused, Sonnet is allowed.
+- **No auth-profile rotation** (`allowAuthProfileFallback: false`).
+- **Replacing the credential stops the job** with "inference account was
+  replaced". After rotating a key or token, re-run the edit for every job bound
+  to it.
+
+The edit also reset `toolsAllowProvenance.callerOrigin` to unknown on the Julius
+job, so check that field on jobs that rely on it.
+
 ### Deploy notes
 
 - Boot-time Doctor migrated agent DBs v25 -> v27 and Matrix account SQLite (v22
@@ -1454,7 +1489,7 @@ RSS caused a global OOM kill on 2026-11-06). Run focused vitest files in a
   is attached to, in place.
 - **Do not run the Pre-flight/Strategy B `git clean -fd` blindly:** the untracked
   `.env.bak-pre-vero-*-20261028` files in the repo root would be deleted. Skipped
-  this cycle.
+  this cycle. Those backups were removed on 2026-11-06 (no unique values).
 - **Step 6 change:** `openclaw memory status` no longer works against a running
   gateway ("requires exclusive offline state ownership"), so the memory check
   and any `--index` now need the gateway stopped and a one-off container using
