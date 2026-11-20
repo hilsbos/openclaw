@@ -30,6 +30,20 @@ function assertAgentDatabaseConfiguration(
   }
 }
 
+/**
+ * local: the configured refresh still rejects a deferred agent's in-flight scoped
+ * publication with a plain Error ("owner is stale after config publication"), which the
+ * typed lifecycle check upstream does not match. Seen on 2026.11.1 as Vero booting
+ * degraded. Drop once upstream types that error.
+ */
+function isStartupModelRuntimeSupersession(error: unknown): boolean {
+  return (
+    isPreparedModelRuntimePluginLifecycleFailure(error) ||
+    (error instanceof Error &&
+      error.message === "prepared model runtime owner is stale after config publication")
+  );
+}
+
 /** Finish only the deferred agent's preparation before its admission owner recovers it. */
 export function activateGatewayAgentDatabaseStartup(params: {
   admission: ReturnType<typeof getAgentDatabaseStartupAdmission>;
@@ -215,7 +229,7 @@ export function activateGatewayAgentDatabaseStartup(params: {
           }),
         ).catch(async (error: unknown) => {
           // A reload retires this owner's plugins and supersedes its build alike.
-          if (!isPreparedModelRuntimePluginLifecycleFailure(error)) {
+          if (!isStartupModelRuntimeSupersession(error)) {
             throw error;
           }
           // Let the current publication settle before the admission owner's bounded retry.

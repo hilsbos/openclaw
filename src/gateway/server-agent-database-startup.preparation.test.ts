@@ -650,6 +650,30 @@ it.for(["secrets", "model runtime"] as const)(
   },
 );
 
+// local: the plain stale-owner Error from the configured refresh is a supersession too.
+it("retries publication after the full startup refresh marks the owner stale", async ({
+  signal,
+}) => {
+  const fleet = createFleet(["idle"]);
+  const replacementSettled = createDeferredCore();
+  mocks.replacement.mockReturnValueOnce(replacementSettled.promise);
+  mocks.refreshModels.mockRejectedValueOnce(
+    new Error("prepared model runtime owner is stale after config publication"),
+  );
+  await fleet.run(async (admission) => {
+    fleet.inspect(0);
+    await vi.waitFor(() => expect(mocks.replacement).toHaveBeenCalledTimes(1));
+    // The retry must not race the refresh that cancelled this attempt.
+    expect(mocks.refreshModels).toHaveBeenCalledTimes(1);
+    replacementSettled.resolve();
+    await withinTest(admission.waitForAgentPreparation("idle", fleet)!, signal);
+    expect(readAgentDatabaseAdmissionRefusal("idle", fleet)).toBeUndefined();
+    expect(mocks.refreshModels).toHaveBeenCalledTimes(2);
+    expect(mocks.info).toHaveBeenCalledWith(recoveredMessage, expect.anything());
+  });
+});
+
+
 it.for(["initial", "successor"] as const)(
   "preserves a genuine %s model publication failure without retrying",
   async (publication, { signal }) => {
