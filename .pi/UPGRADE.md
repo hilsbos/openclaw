@@ -1622,3 +1622,94 @@ in ~6 s (install takes a few minutes; delete the copy afterwards, it is large).
   `fetch timeout ... getMe` / `fetch fallback: ... alternative Telegram API IP`,
   `/readyz` returns 503. The health monitor's in-process restart may not clear
   it; a gateway restart does.
+
+## v2026.11.6 upgrade notes (2026-11-20)
+
+### Crossed release lines again: 11.4 is NOT an ancestor of 11.5/11.6
+
+`v2026.11.4` and `v2026.11.6` diverge at a 2026-10-14 commit (1,779 commits on
+the 11.4 side, 12,217 on the 11.6 side; ~46k files changed). `v2026.11.5` IS an
+ancestor of 11.6, so 11.5/11.6 are the new mainline. Went straight to 11.6 with
+Strategy B and `BASE=v2026.11.4`.
+
+### Strategy B stats
+
+- Custom delta 15 files: 3 additive, 2 zero-churn (iOS), 10 upstream-churned.
+  `git apply --3way`: 4 conflicts, all in the documented churn files.
+- `diagnostics-otel/src/service-events.ts`: upstream dropped the explicit handler
+  map; the recorders object is now keyed by event type and dispatched with
+  `recorders[evt.type]`. Took upstream's file unchanged (our delta there is now
+  empty) and added the recorder as a `"tool.call"(evt) {...}` key in
+  `service-recorders-tools.ts`. Metric names unchanged
+  (`openclaw_tool_calls_total`, `openclaw_tool_duration_ms_*`).
+- `embedded-agent-subscribe.handlers.tools.completion.ts`: import-only conflict;
+  the `tool.call` emission hunk applied cleanly.
+- `base.css`: took our accent block; kept upstream's new `--bg-content`/`--muted*`
+  vars, plus our `--primary-hover`.
+- gogcli / goplaces pins still current; no bump.
+
+### Startup-retry patch re-ported
+
+`server-agent-database-startup.ts` was heavily refactored upstream. The catch
+around `refreshPreparedModelRuntimeSnapshots` now uses the typed
+`isPreparedModelRuntimePluginLifecycleFailure`, but the configured refresh still
+throws a plain `Error("prepared model runtime owner is stale after config
+publication")` (`prepared-model-runtime.configured-refresh.ts`). Re-ported as a
+wider predicate `isStartupModelRuntimeSupersession` used in that catch, plus the
+same regression test. 26/26 pass; **negative control: without the predicate the
+new test fails on 11.6**, so the patch is still needed. Two boots after the
+deploy came up with every agent admitted and no `remains degraded`.
+
+### Security review (Step 2) — clean
+
+- gitleaks `custom..v2026.11.6`: 7 hits after the standard filter, all
+  fixtures/placeholders plus a public GitHub App client ID in a release workflow.
+- semgrep (git-archive copy): 10 results in changed files, all benign
+  (loopback-only fetch, escaped/JSON-serialized HTML, the plugin-auth probe already
+  seen on 11.1, chat HTML preview).
+- Dockerfile: **base moved bookworm -> trixie (Debian 13)**, new digests, new apt
+  packages `acl e2fsprogs psmisc` (SQLite NOCOW repair), A2UI stub fallback
+  removed, `OPENCLAW_INSTALL_BROWSER` now accepts `''|0|1|chromium|headless-shell`
+  (1 = legacy behaviour). No compose changes. `Dockerfile.local` needed no change.
+- New deps: `@modelcontextprotocol/{client,core,node,server}`, `fast-uri`,
+  `parse5`, `proxy-from-env`, `@opentelemetry/semantic-conventions`; removed
+  `@mistralai/mistralai`. New hosts are provider endpoints plus
+  `uploads.github.com` (PR evidence upload through the SSRF guard). The base64 blob
+  in `scripts/lib/fs-safe-npm-cli-preload.generated.mjs` decodes to a small npm
+  CLI path probe produced by `scripts/generate-runtime-script-assets.mjs`.
+
+### Deploy
+
+- **Run compose with the same privileges that can read `.env`.** Otherwise
+  `docker compose stop` errors out and the gateway keeps running. Confirm it
+  actually stopped before taking a "consistent" state backup.
+- Downtime ~2.5 min. The base image build is cold on the new distro; run it in
+  parallel with the security review.
+- Boot-time Doctor: agent DBs v27 -> v38, shared state and Matrix account SQLite
+  to v36, Matrix replay markers moved to the durable ingress spool, with
+  `*.pre-startup-migration-*.bak` copies. The Doctor report shows
+  `schema=1, expected=36` for each Matrix `client/credentials.sqlite`; that is a
+  new store created by the "moved client credentials" migration, and Matrix
+  connected normally afterwards.
+- **Heartbeat retirement:** Doctor converts per-agent heartbeat config and
+  `HEARTBEAT.md` files into automation jobs named "Proactive check (<agent>)",
+  keeping the previous enabled/disabled state, and removes the heartbeat keys from
+  `openclaw.json` (backup `openclaw.json.bak`). Migrated heartbeats lose
+  heartbeat-specific duplicate suppression and no-route skipping.
+- **`openclaw cron list --json` no longer prints `inferenceBinding`.** Read
+  `cron_jobs.job_json` in `state/openclaw.sqlite` to verify bindings. Agent-turn
+  models now display as `provider/model@profileId`. Bindings survived the migration.
+- No memory reindex needed (no "Vector search: paused").
+- New Doctor advisory per agent: "Remember across conversations is effectively
+  enabled ... but the Active Memory plugin is disabled".
+- Known upstream bug in 11.6: every restart logs `Deferred restart resume failed
+  for agent <id>: Session database target changed outside captured discovery
+  custody`, so turns interrupted by a restart are not auto-resumed for deferred
+  agents. openclaw/openclaw#200651, fixed on main after the 11.6 cut. Recheck on
+  the next upgrade.
+- Expected noise: `Error decrypting event ... sent before this device logged in`
+  for old Matrix history, `control-ui-build-mismatch` from a stale browser tab,
+  a `MaxListenersExceededWarning`, and a usage-cost cache refresh failure on a
+  `.jsonl.deleted.*` archive.
+- `openclaw-cli` exits 137 whenever the gateway restarts (shared PID namespace);
+  `docker compose up -d` brings it back.
