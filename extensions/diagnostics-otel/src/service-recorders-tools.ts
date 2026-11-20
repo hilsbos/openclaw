@@ -180,6 +180,29 @@ export function createToolAndSystemRecorders(runtime: DiagnosticsRecorderRuntime
       runtime.setSpanAttrs(span, spanAttrs);
       span.end(toolTimestampMs(evt));
     },
+    "tool.call"(evt) {
+      const attrs = {
+        "openclaw.tool": evt.toolName,
+        "openclaw.outcome": evt.isError ? "error" : "success",
+        ...(evt.channel ? { "openclaw.channel": evt.channel } : {}),
+      };
+      runtime.toolCallCounter.add(1, attrs);
+      if (typeof evt.durationMs === "number") {
+        runtime.toolCallDurationHistogram.record(evt.durationMs, attrs);
+      }
+      if (!runtime.tracesEnabled) {
+        return;
+      }
+      const spanAttrs: Record<string, string | number> = { ...attrs };
+      if (evt.toolCallId) {
+        spanAttrs["openclaw.toolCallId"] = evt.toolCallId;
+      }
+      const span = runtime.spanWithDuration("openclaw.tool.call", spanAttrs, evt.durationMs);
+      if (evt.isError) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: "tool call error" });
+      }
+      span.end();
+    },
     "payload.large"(evt) {
       const attrs = {
         "openclaw.payload.action": evt.action,
